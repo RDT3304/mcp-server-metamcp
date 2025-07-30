@@ -1,44 +1,73 @@
-# Use the official uv Debian image as base
-FROM ghcr.io/astral-sh/uv:debian
+# Dockerfile.external-db - Modified for external PostgreSQL
 
-# Install Node.js and npm
-RUN apt-get update && apt-get install -y \
-    curl \
-    gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+FROM node:18-alpine AS base
 
-# Verify Node.js and npm installation
-RUN node --version && npm --version
+# Install system dependencies
+RUN apk add --no-cache libc6-compat python3 make g++ curl
+RUN npm install -g pnpm
 
-# Verify uv is installed correctly
-RUN uv --version
+# Install additional tools that MCP servers might need
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    nodejs \
+    npm \
+    git \
+    bash
 
-# Verify npx is available
-RUN npx --version || npm install -g npx
+# Install uvx and npx globally for MCP servers
+RUN pip3 install uvx
+RUN npm install -g npx
 
-# Set the working directory
 WORKDIR /app
 
 # Copy package files
-COPY package*.json ./
+COPY package.json pnpm-lock.yaml* ./
+COPY apps/frontend/package.json ./apps/frontend/
+COPY apps/backend/package.json ./apps/backend/
+COPY packages/ ./packages/
 
 # Install dependencies
-RUN npm ci
+RUN pnpm install --frozen-lockfile
 
-# Copy the rest of the application
+# Copy source code
 COPY . .
 
 # Build the application
-RUN npm run build
+RUN pnpm build
 
-# Set environment variables
-ENV NODE_ENV=production
+# Create a healthcheck script for database connection
+RUN echo '#!/bin/sh\n\
+curl -f http://localhost:12008/health || exit 1' > /healthcheck.sh
+RUN chmod +x /healthcheck.sh
+
+# Create startup script that waits for database
+RUN echo '#!/bin/sh\n\
+echo "Waiting for database connection..."\n\
+until nc -z $POSTGRES_HOST $POSTGRES_PORT; do\n\
+  echo "Database not ready, waiting..."\n\
+  sleep 2\n\
+done\n\
+echo "Database is ready!"\n\
+\n\
+# Run database migrations if needed\n\
+echo "Running database setup..."\n\
+pnpm db:migrate || echo "Migration completed or not needed"\n\
+\n\
+# Start the application\n\
+echo "Starting MetaMCP..."\n\
+exec pnpm start' > /start.sh
+RUN chmod +x /start.sh
+
+# Install netcat for database connection check
+RUN apk add --no-cache netcat-openbsd
 
 # Expose the application port
-EXPOSE 3000
+EXPOSE 12008
 
-# Run the application
-ENTRYPOINT ["node", "dist/index.js"] 
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD /healthcheck.sh
+
+# Use the startup script
+CMD ["/start.sh"]
